@@ -1,0 +1,96 @@
+import sympy as sp
+from functools import lru_cache
+from multiprocessing import Pool, cpu_count
+import gc
+
+# Symbols
+n, x, o = sp.symbols('n x o')
+m, k_sym = sp.symbols('m k_sym')
+even_rule = n / 2
+odd_rule = (3 * n + 1) / 2**o
+f1 = (4**k_sym * m - 1) / 3
+f2 = 2 * (4**k_sym - 1)/3 * m - 1
+
+@lru_cache(maxsize=1024)
+def grammar_gf(start, depth=3):
+    expr = start
+    for i in range(depth):
+        if isinstance(expr, sp.Expr) and expr.as_poly(x).degree() > depth // 2:
+            break
+        expr = sp.Piecewise((even_rule.subs(n, expr), sp.Mod(expr, 2)==0),
+                            (odd_rule.subs(n, expr), True)) * x**i
+    return expr + start
+
+@lru_cache(maxsize=1024)
+def inverse_gf(root, depth=2, k_val=3):
+    expr = root
+    subs_k = {k_sym: k_val}
+    for _ in range(depth):
+        expr = sp.Piecewise((f1.subs(subs_k).subs(m, expr), sp.Mod(expr, 3)==1),
+                            (f2.subs(subs_k).subs(m, expr), True))
+    return expr * x**depth + root
+
+def merge_gfs(gf1, gf2):
+    commons, simplified = sp.cse([gf1, gf2])
+    rebuilt = [expr.subs(commons[::-1]) for expr in simplified]
+    return sp.simplify(sum(rebuilt))
+
+def prune_gf(gf, max_degree=20):
+    poly = gf.as_poly(x)
+    if poly is None or poly.degree() > max_degree:
+        print(f"Pruned: Degree {poly.degree() if poly else 'None'} > {max_degree}")
+        return sp.sympify(0)
+    coeffs = poly.all_coeffs()
+    if all(c.is_rational for c in coeffs if c != 0):
+        const = coeffs[-1]  # Constant term
+        if const.is_integer and abs(const) < 2**71:  # Tail check
+            print(f"Reconverged: Constant {const} < 2^71")
+            return gf
+    print("Pruned: Non-integer or large constant")
+    return sp.sympify(0)
+
+def process_residue(res, k_val, depth, prune_bound, P_val=1, d_val=0):
+    try:
+        start_num = P_val * 10**(d_val + k_val) + res
+        temp = 3 * start_num + 1
+        v = 0
+        while temp % 2 == 0:
+            temp //= 2
+            v += 1
+        gf_fwd = grammar_gf(sp.sympify(start_num), depth).subs(o, v)
+        gf_inv = inverse_gf(res, depth, k_val).subs(o, v)
+        
+        print(f"Pre-merge for res={res}, P={P_val}: Fwd={gf_fwd}, Inv={gf_inv}")
+        
+        merged = merge_gfs(gf_fwd, gf_inv)
+        pruned = prune_gf(merged, prune_bound)
+        gc.collect()
+        return pruned
+    except Exception as e:
+        print(f"Error for res={res}, P={P_val}: {e}")
+        return sp.sympify(0)
+
+def residue_merge(k_val=3, depth=3, prune_bound=20, batch_size=None):
+    mod = 10 ** k_val
+    residues = list(range(1, mod, 2))
+    if batch_size is None:
+        batch_size = max(1, len(residues) // (cpu_count() * 2))
+    
+    results = []
+    for P in range(10):  # P loop for m=1 (0 to 9)
+        with Pool(processes=cpu_count()) as pool:
+            for i in range(0, len(residues), batch_size):
+                batch = residues[i:i+batch_size]
+                batch_results = pool.starmap(process_residue, [(res, k_val, depth, prune_bound, P) for res in batch])
+                results.extend(batch_results)
+                gc.collect()
+    
+    merged_all = sum(results)
+    if merged_all == 0 or not isinstance(merged_all, sp.Expr):
+        return "All paths pruned: 0"
+    return merged_all.simplify()
+
+# Run for k=3
+result = residue_merge(k_val=3)
+print("Merged GF with residues and pruning:")
+print(result)
